@@ -23,17 +23,55 @@
 #include "frame.h"
 
 
+/* FLAGS describes FCS presence for each packet. Drivers may mix frames with
+   and without an FCS on the same interface. Keep --nofcs as an override and
+   retain the historical assumption when radiotap does not supply FLAGS. */
+static int capture_header(const uint8 *pack, int len, int has_rth,
+			  int *rthl, int *has_fcs)
+{
+	uint16 header_len;
+	uint32 present, extension;
+	int offset;
+
+	*rthl = 0;
+	if (!has_rth)
+		return TRUE;
+	if (len < (int)RTH_SIZE || pack[0] != 0)
+		return FALSE;
+	memcpy(&header_len, pack + 2, sizeof(header_len));
+	*rthl = le16toh(header_len);
+	if (*rthl < (int)RTH_SIZE || *rthl > len)
+		return FALSE;
+	memcpy(&present, pack + 4, sizeof(present));
+	present = le32toh(present);
+	extension = present;
+	offset = RTH_SIZE;
+	while (extension & (1U << 31)) {
+		if (*rthl - offset < (int)sizeof(extension))
+			return FALSE;
+		memcpy(&extension, pack + offset, sizeof(extension));
+		extension = le32toh(extension);
+		offset += sizeof(extension);
+	}
+	if (present & (1U << 1)) {
+		/* TSFT precedes FLAGS and is aligned to eight bytes from the
+		   beginning of the radiotap header, after all presence words. */
+		if (present & (1U << 0))
+			offset = ((offset + 7) & ~7) + 8;
+		if (offset >= *rthl)
+			return FALSE;
+		*has_fcs = *has_fcs && (pack[offset] & 0x10);
+	}
+	return TRUE;
+}
+
+
 int parse_packet(frame_t *fp, uint8 *pack, int len, int has_rth, int has_fcs)
 {
 	rth_t	*rth = (rth_t*)pack;
 	int	rthl = 0;
-	if (has_rth) {
-		if (len < (int)RTH_SIZE)
-			return EAPFAIL;			/* truncated radiotap header */
-		rthl = le16toh(rth->it_len);
-		if (rthl < (int)RTH_SIZE || rthl > len)
-			return EAPFAIL;			/* bogus radiotap length */
-	};
+	if (!capture_header(pack, len, has_rth, &rthl, &has_fcs))
+		return EAPFAIL;
 
 	if (len - rthl < 1)
 		return EAPFAIL;				/* no room for a MAC header */
@@ -516,42 +554,213 @@ void set_bpf_filter(struct global *G)
 };
 
 
-int next_packet(struct global *G, uint8 type, uint8 subtype, const void *dest, const void *src,
-			int pkt, int parse)
+/* Firmware can deliver a protocol reply before its separately reported ACK.
+   Retain only complete AP-to-station replies, with bounded owned storage. */
+#define DEFERRED_PACKET_COUNT 8
+#define DEFERRED_PACKET_SIZE 65536
+
+struct deferred_packet {
+	struct deferred_packet *next;
+	phdr_t header;
+	int rthl;
+	uint8 data[];
+};
+
+static void deferred_reset(struct global *G)
+{
+	struct deferred_packet *packet;
+
+	while ((packet = G->deferred_head) != NULL) {
+		G->deferred_head = packet->next;
+		free(packet);
+	}
+	if (G->deferred_parsed && G->inp &&
+	    G->inp[F_ALL].data == G->deferred_parsed->data) {
+		for (int i = 0; i < F_MAX; i++) {
+			G->inp[i].data = NULL;
+			G->inp[i].size = 0;
+		}
+	}
+	free(G->deferred_parsed);
+	G->deferred_parsed = G->deferred_tail = NULL;
+	G->deferred_count = 0;
+	G->deferred_pfd = NULL;
+	gettimeofday(&G->deferred_since, NULL);
+}
+
+static void deferred_sync(struct global *G)
+{
+	if (G->deferred_pfd == G->pfd &&
+	    !memcmp(G->deferred_bssid, G->bssid, 6) &&
+	    !memcmp(G->deferred_hwmac, G->hwmac, 6))
+		return;
+	deferred_reset(G);
+	G->deferred_pfd = G->pfd;
+	memcpy(G->deferred_bssid, G->bssid, 6);
+	memcpy(G->deferred_hwmac, G->hwmac, 6);
+}
+
+static int packet_fcs_valid(struct global *G, uint8 *pack, int len,
+			    int rthl, int has_fcs)
+{
+	if (has_fcs && !G->nocheck) {
+		uint32 crc = ~crc32(pack + rthl, len - rthl - 4);
+		uint32 fcs = ((fcs_t *)(pack + len - 4))->fcs;
+		return bswap_32(crc) == be32toh(fcs);
+	}
+	return TRUE;
+}
+
+static int deferred_response(struct global *G, uint8 *pack, int len,
+			     int rthl, int has_fcs)
+{
+	mac_t *mac = (mac_t *)(pack + rthl);
+	int macl = MAC_SIZE_NORM;
+	int remaining = len - rthl - (has_fcs ? 4 : 0);
+
+	if (remaining < macl || memcmp(mac->adr1.addr, G->hwmac, 6) ||
+	    memcmp(mac->adr2.addr, G->bssid, 6))
+		return FALSE;
+	if (mac->type == MAC_TYPE_MGMT)
+		return (mac->subtype == MAC_ST_AUTH ||
+			mac->subtype == MAC_ST_ASSOC_RESP) && remaining >= macl + 6;
+	if (mac->type != MAC_TYPE_DATA ||
+	    (mac->subtype != MAC_ST_DATA && mac->subtype != MAC_ST_QOSDATA))
+		return FALSE;
+	if (mac->subtype == MAC_ST_QOSDATA)
+		macl += QOS_SIZE;
+	if (remaining < macl + (int)LLC_SIZE + (int)D1X_SIZE ||
+	    memcmp((uint8 *)mac + macl, "\xaa\xaa\x03\x00\x00\x00\x88\x8e", LLC_SIZE))
+		return FALSE;
+	d1x_t *d1x = (d1x_t *)((uint8 *)mac + macl + LLC_SIZE);
+	return be16toh(d1x->len) <= remaining - macl - (int)LLC_SIZE - (int)D1X_SIZE;
+}
+
+static int deferred_same(struct deferred_packet *packet, const mac_t *mac)
+{
+	const mac_t *saved = (const mac_t *)(packet->data + packet->rthl);
+
+	return saved->type == mac->type && saved->subtype == mac->subtype &&
+		saved->sequence == mac->sequence;
+}
+
+static void deferred_save(struct global *G, uint8 *pack, int len, int rthl)
+{
+	struct deferred_packet *packet;
+	mac_t *mac = (mac_t *)(pack + rthl);
+
+	if (len > DEFERRED_PACKET_SIZE || G->deferred_count >= DEFERRED_PACKET_COUNT ||
+	    G->phdr->ts.tv_sec < G->deferred_since.tv_sec ||
+	    (G->phdr->ts.tv_sec == G->deferred_since.tv_sec &&
+	     G->phdr->ts.tv_usec < G->deferred_since.tv_usec))
+		return;
+	for (packet = G->deferred_head; packet; packet = packet->next)
+		if (deferred_same(packet, mac))
+			return;
+	if (G->deferred_parsed && deferred_same(G->deferred_parsed, mac))
+		return;
+	packet = malloc(sizeof(*packet) + len);
+	if (!packet)
+		return;
+	packet->next = NULL;
+	packet->header = *G->phdr;
+	packet->rthl = rthl;
+	memcpy(packet->data, pack, len);
+	if (G->deferred_tail)
+		G->deferred_tail->next = packet;
+	else
+		G->deferred_head = packet;
+	G->deferred_tail = packet;
+	G->deferred_count++;
+}
+
+static struct deferred_packet *deferred_take(struct global *G, uint8 type,
+				uint8 subtype, const void *dest, const void *src)
+{
+	struct deferred_packet **link = &G->deferred_head, *previous = NULL;
+	struct deferred_packet *packet;
+
+	while ((packet = *link) != NULL) {
+		mac_t *mac = (mac_t *)(packet->data + packet->rthl);
+		if (mac->type == type &&
+		    (mac->subtype == subtype ||
+		     (type == MAC_TYPE_DATA && mac->subtype == (subtype | MAC_ST_QOSDATA))) &&
+		    (!memcmp(dest, NULL_MAC, 6) || !memcmp(mac->adr1.addr, dest, 6)) &&
+		    (!memcmp(src, NULL_MAC, 6) || !memcmp(mac->adr2.addr, src, 6))) {
+			*link = packet->next;
+			if (G->deferred_tail == packet)
+				G->deferred_tail = previous;
+			packet->next = NULL;
+			G->deferred_count--;
+			return packet;
+		}
+		previous = packet;
+		link = &packet->next;
+	}
+	return NULL;
+}
+
+static void packet_timeout(struct global *G, int pkt, struct timeval *timeout)
+{
+	if (times[pkt].user)
+		set_timer(timeout, times[pkt].user);
+	else if (G->suppress)
+		set_timer(timeout, times[pkt].def);
+	else
+		set_timer(timeout, times[pkt].avg + (times[pkt].avg>>3) + 5);
+}
+
+static int next_packet_until(struct global *G, uint8 type, uint8 subtype,
+			const void *dest, const void *src, int pkt, int parse,
+			struct timeval *deadline)
 {
 	struct timeval timeout, begin;
+	struct deferred_packet *deferred = NULL;
 
 	uint8	*pack;
 	int	len, fc = 0, time;
 
+	deferred_sync(G);
 	gettimeofday(&begin, 0);
 
-	if (times[pkt].user)
-		set_timer(&timeout, times[pkt].user);
-	else if (G->suppress)
-		set_timer(&timeout, times[pkt].def);
+	if (deadline)
+		timeout = *deadline;
 	else
-		set_timer(&timeout, times[pkt].avg + (times[pkt].avg>>3) + 5);
+		packet_timeout(G, pkt, &timeout);
 
-	while (!ctrlc || START_EAPOL < G->state) {
+	while (!ctrlc || (!deadline && START_EAPOL < G->state)) {
+		free(deferred);
+		deferred = NULL;
 
-		if (check_timer(&timeout)) {
-			times[pkt].avg = (times[pkt].avg * times[pkt].count + times[pkt].max) / (times[pkt].count + 1);
-			times[pkt].count++;
-			return TIMEOUT;
-		};
+		if (check_timer(&timeout))
+			goto timed_out;
 
-		if ((pack = (uint8*)pcap_next(G->pfd, G->phdr)) == 0)
+		if (pkt != PKT_ACK)
+			deferred = deferred_take(G, type, subtype, dest, src);
+		if (deferred) {
+			*G->phdr = deferred->header;
+			pack = deferred->data;
+		} else if ((pack = (uint8*)pcap_next(G->pfd, G->phdr)) == 0)
 			continue;
-		if ((len = G->phdr->len) == 0)
+		if (deadline) {
+			if (ctrlc) {
+				free(deferred);
+				return ctrlc;
+			}
+			if (check_timer(&timeout))
+				goto timed_out;
+		}
+		if ((len = G->phdr->caplen) <= 0 || G->phdr->caplen < G->phdr->len)
 			continue;
 
-		rth_t	*rth = (rth_t*)pack;
-		int	rthl = (G->has_rth ? le16toh(rth->it_len) : 0);
+		int	rthl, has_fcs = G->has_fcs;
+		if (!capture_header(pack, len, G->has_rth, &rthl, &has_fcs))
+			continue;
 
 		/* A bogus radiotap length must not push the MAC header past the
-		   captured frame (adr1 ends at +10, adr2 at +16). */
-		if (rthl < 0 || rthl + MAC_SIZE_ACK > len)
+		   captured frame (adr1 ends at +10, adr2 at +16), or leave no
+		   room for a claimed FCS before CRC validation. */
+		if (len - rthl < (int)MAC_SIZE_ACK + (has_fcs ? 4 : 0))
 			continue;
 
 		mac_t	*mac = (mac_t*)(pack+rthl);
@@ -569,25 +778,31 @@ int next_packet(struct global *G, uint8 type, uint8 subtype, const void *dest, c
 
 		time = elapsed(&begin);
 
-		if (G->has_fcs && !G->nocheck) {
-			uint32 crc = ~crc32((u_char*)mac, len-rthl-4);
-			uint32 fcs = ((fcs_t*)(pack+len-4))->fcs;
-			if (bswap_32(crc) != be32toh(fcs)) {
+		if (!packet_fcs_valid(G, pack, len, rthl, has_fcs)) {
 				fc++;
 				if (MAX_FCS_FAIL<=fc) {
 					vprint("[!] Excessive (%d) FCS failures while reading next packet\n",
 						MAX_FCS_FAIL);
+					free(deferred);
 					return FCSFAIL;
 				} else
 					continue;
-			};
 		};
 
 		times[pkt].avg = (times[pkt].avg * times[pkt].count + time) / (times[pkt].count + 1);
 		times[pkt].count++;
 
-		if (parse)
-			return parse_packet(G->inp, pack, len, G->has_rth, G->has_fcs);
+		if (parse) {
+			int result = parse_packet(G->inp, pack, len, G->has_rth, has_fcs);
+			/* The parser exposes pointers into pack, including on EAP failure. */
+			if (G->inp[F_ALL].data == pack) {
+				free(G->deferred_parsed);
+				G->deferred_parsed = deferred;
+				deferred = NULL;
+			}
+			free(deferred);
+			return result;
+		}
 
 		break;
 
@@ -597,17 +812,38 @@ int next_packet(struct global *G, uint8 type, uint8 subtype, const void *dest, c
 				&& memcmp(dest,NULL_MAC,6) != 0)
 			{
 				vprint("[!] Received disassociation/deauthentication from the AP\n");
+				free(deferred);
 				return DEORDIS;
 			};
+		if (pkt == PKT_ACK && !deferred &&
+		    deferred_response(G, pack, len, rthl, has_fcs) &&
+		    packet_fcs_valid(G, pack, len, rthl, has_fcs))
+			deferred_save(G, pack, len, rthl);
 	};
 
-	return (ctrlc && G->state <= START_EAPOL ? ctrlc : SUCCESS);
+	free(deferred);
+	return (ctrlc && (deadline || G->state <= START_EAPOL) ? ctrlc : SUCCESS);
+
+timed_out:
+	free(deferred);
+	times[pkt].avg = (times[pkt].avg * times[pkt].count + times[pkt].max) / (times[pkt].count + 1);
+	times[pkt].count++;
+	return TIMEOUT;
 };
 
 
-int send_packet(struct global *G, uint8 *pack, int len, int noack)
+int next_packet(struct global *G, uint8 type, uint8 subtype, const void *dest, const void *src,
+			int pkt, int parse)
+{
+	return next_packet_until(G, type, subtype, dest, src, pkt, parse, NULL);
+}
+
+
+static int send_packet_until(struct global *G, uint8 *pack, int len, int noack,
+			     struct timeval *deadline)
 {
 	int result = SUCCESS;
+	deferred_sync(G);
 
 	mac_t *mac = (mac_t*)(pack+RTH_SIZE);
 
@@ -626,6 +862,12 @@ int send_packet(struct global *G, uint8 *pack, int len, int noack)
 	int count = 0;
 
 retry_snd:
+	if (deadline) {
+		if (ctrlc)
+			return ctrlc;
+		if (check_timer(deadline))
+			return TIMEOUT;
+	}
 	if (pcap_inject(G->pfd, pack, len) != len) {
 		vprint("[!] Pcap injection error, failed packet follows\n");
 		vprint("[!] >%s<\n",hex(pack,len));
@@ -633,7 +875,15 @@ retry_snd:
 	};
 
 	if (G->use_ack && !noack) {
-		result = next_packet(G, MAC_TYPE_CTRL, MAC_ST_ACK, mac->adr2.addr, NULL_MAC, PKT_ACK, FALSE);
+		struct timeval ack_timeout, *ack_deadline = NULL;
+		if (deadline) {
+			packet_timeout(G, PKT_ACK, &ack_timeout);
+			if (timercmp(deadline, &ack_timeout, <))
+				ack_timeout = *deadline;
+			ack_deadline = &ack_timeout;
+		}
+		result = next_packet_until(G, MAC_TYPE_CTRL, MAC_ST_ACK,
+				mac->adr2.addr, NULL_MAC, PKT_ACK, FALSE, ack_deadline);
 		if (result == TIMEOUT) {
 			if (count++ < G->retries)
 				goto retry_snd;
@@ -643,6 +893,63 @@ retry_snd:
 
 	return result;
 };
+
+
+int send_packet(struct global *G, uint8 *pack, int len, int noack)
+{
+	return send_packet_until(G, pack, len, noack, NULL);
+}
+
+
+/* Discovery can cross bands, so use the current frequency for each probe.
+   The --wpsinfo path separately retains the rates learned from the AP. */
+static int send_probe_request(struct global *G)
+{
+	static uint8 rates_b[] = { TAG_RATE, 4, 0x02, 0x04, 0x0b, 0x16 };
+	static uint8 rates_g[] = {
+		TAG_RATE, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24
+	};
+	static uint8 rates_g_ext[] = { TAG_XRAT, 4, 0x30, 0x48, 0x60, 0x6c };
+	static uint8 rates_a[] = {
+		TAG_RATE, 8, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c
+	};
+	uint8 ssid[2 + 32] = { TAG_SSID, 0 };
+	tag_t *tags[4] = { (tag_t *)ssid, NULL, NULL, NULL };
+	uint8 *ies, *packet;
+	size_t ssid_len;
+	int freq, ies_len, result;
+	mac_t *mac = (mac_t *)&prober[RTH_SIZE];
+
+	if (!G->essid || G->chanx <= 0 || G->chanx > G->chans[0]) {
+		vprint("[!] Cannot send a probe without a known SSID and channel\n");
+		return INJFAIL;
+	}
+	ssid_len = strlen(G->essid);
+	if (ssid_len > sizeof(ssid) - TAG_SIZE)
+		return INJFAIL;
+	((tag_t *)ssid)->len = ssid_len;
+	memcpy(ssid + TAG_SIZE, G->essid, ssid_len);
+	freq = G->freqs[G->chanx];
+	if (freq >= 5000 && freq < 6000) {
+		tags[1] = (tag_t *)rates_a;
+	} else if (freq == 2484) {
+		tags[1] = (tag_t *)rates_b;
+	} else if (freq >= 2400 && freq < 2500) {
+		tags[1] = (tag_t *)rates_g;
+		tags[2] = (tag_t *)rates_g_ext;
+	} else {
+		vprint("[!] Unsupported probe frequency '%d' MHz\n", freq);
+		return INJFAIL;
+	}
+
+	memcpy(mac->adr2.addr, G->hwmac, 6);
+	ies = build_ietags(tags, &ies_len);
+	packet = build_packet(prober, sizeof(prober) - 1, ies, ies_len);
+	free(ies);
+	result = send_packet(G, packet, sizeof(prober) - 1 + ies_len, 1);
+	free(packet);
+	return result;
+}
 
 
 void pcap_wait(struct global *G, int msdelay)
@@ -664,12 +971,20 @@ int	reassoc(struct global *G)
 	};
 
 reassoc:
+	deferred_reset(G);
 	G->state = START_ASSOC;
 	if (ctrlc)
 		return ctrlc;
 
 	if (G->probe) {
-		result = send_packet(G, G->dprobe, G->reql, 1);
+		if (G->wpsinfo)
+			result = send_packet(G, G->dprobe, G->reql, 1);
+		else
+			result = send_probe_request(G);
+		if (result != SUCCESS) {
+			vprint("[!] Unable to send probe request\n");
+			return result;
+		}
 		result = next_packet(G, MAC_TYPE_MGMT, MAC_ST_PROBE_RESP,
 						G->hwmac, G->bssid, PKT_PR, TRUE);
 	} else
@@ -774,6 +1089,7 @@ int wpstran(struct global *G)
 	wpab_t	*msg;
 	uint8	*pack;
 	vtag_t	*tag;
+	struct timeval m1_deadline;
 
 	G->state = START_EAPOL;
 	result = send_packet(G, eapols, sizeof(eapols)-1, 0);
@@ -802,13 +1118,19 @@ int wpstran(struct global *G)
 	if (result != SUCCESS)
 		return result;
 	G->wdata->state = RECV_M1;
+	packet_timeout(G, PKT_M1, &m1_deadline);
 
 read_mx:
+	if (G->wdata->state == RECV_M1 && ctrlc)
+		return ctrlc;
 	G->state++;
 	state = G->wdata->state;
 
-	result = next_packet(G, MAC_TYPE_DATA, MAC_ST_DATA, G->hwmac, G->bssid,
-				((G->state-10)>>1)+6, TRUE);
+	result = next_packet_until(G, MAC_TYPE_DATA, MAC_ST_DATA, G->hwmac, G->bssid,
+				((G->state-10)>>1)+6, TRUE,
+				state == RECV_M1 ? &m1_deadline : NULL);
+	if (state == RECV_M1 && ctrlc)
+		return ctrlc;
 
 	if (result != SUCCESS) switch (result) {
 		case FCSFAIL:	return result;
@@ -839,8 +1161,18 @@ read_mx:
 	if (!G->inp[F_PAY].list || !G->inp[F_MSG].size) {
 		if (G->inp[F_PAY].list) {
 			eap = (eap_t*)G->inp[F_EAP].data;
-			if (eap->code == EAP_CODE_REQ && eap->type == EAP_TYPE_ID) {
+			if (G->inp[F_EAP].size >= (int)EAP_SIZE &&
+			    eap->code == EAP_CODE_REQ && eap->type == EAP_TYPE_ID) {
 				G->state--;
+				if (state == RECV_M1) {
+					/* A new or retransmitted Identity request can precede M1.
+					   Reply with its ID without extending the M1 deadline. */
+					eap_id[G->eapidx] = eapolf[G->eapidx] = eap->id;
+					result = send_packet_until(G, eap_id, sizeof(eap_id)-1,
+							   0, &m1_deadline);
+					if (result != SUCCESS)
+						return result;
+				}
 				goto read_mx;
 			};
 		};

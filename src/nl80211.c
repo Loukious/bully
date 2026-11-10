@@ -138,7 +138,16 @@ static int nl_send_recv(struct nl80211_state *state, struct nl_msg *msg,
 
 int nl80211_set_freq(struct nl80211_state *state, int ifindex, int freq)
 {
-	struct nl_msg *msg = nlmsg_alloc();
+	struct nl_msg *msg;
+
+	/* The channel option selects a primary frequency, not a bandwidth.
+	 * Keep an existing wider channel when it already has that frequency;
+	 * a monitor interface may share it with an associated station.
+	 */
+	if (nl80211_get_freq(state, ifindex) == freq)
+		return 0;
+
+	msg = nlmsg_alloc();
 	if (!msg)
 		return -ENOMEM;
 

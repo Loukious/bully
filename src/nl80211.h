@@ -26,7 +26,9 @@ int  nl80211_ifindex(const char *ifname);
 int  nl80211_init(struct nl80211_state *state);
 void nl80211_cleanup(struct nl80211_state *state);
 
-/* Set the operating channel by center frequency (MHz, 20 MHz / no-HT). */
+/* Select a primary frequency, preserving an already matching channel width.
+ * A different frequency is requested as 20 MHz / no-HT.
+ */
 int  nl80211_set_freq(struct nl80211_state *state, int ifindex, int freq);
 
 /* Return the current center frequency in MHz, or <= 0 on failure. */

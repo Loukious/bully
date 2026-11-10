@@ -551,6 +551,8 @@ int main(int argc, char *argv[])
 		goto usage_err;
 	};
 	G->chanx = set_chanx(G, G->chanx);
+	if (G->probe && !G->fixed && !G->chanx)
+		G->chanx = next_chan(G);
 	G->start = (G->chanx ? G->chanx : G->chans[0]);
 
 	if (-1 < G->pinstart && G->random) {
@@ -562,6 +564,7 @@ int main(int argc, char *argv[])
 		G->pinstart = G->pindex;
 
 	G->pfd = pcap_open_live(G->ifname, 65536, 1, 5, G->perr);
+	deferred_reset(G);
 	pcap_close(G->pfd);
 	G->pfd = pcap_open_live(G->ifname, 65536, 1, 5, G->perr);
 	if (!G->pfd) {
@@ -577,26 +580,19 @@ int main(int argc, char *argv[])
 	vprint("[+] Datalink type set to '%d', radiotap headers %s\n",
 				G->dlt, (G->has_rth ? "present" : "not present"));
 
-	if (G->probe) {		// Build directed probe request for nonbeaconing AP's
-		mac = (mac_t*)(&prober[RTH_SIZE]);
-		memcpy(mac->adr2.addr, G->hwmac, 6);
-		tags[0] = (tag_t*)(essidt);
-		tags[0]->len = strlen(G->essid);
-		memcpy(tags[0]->data, G->essid, tags[0]->len);
-		int tmpl;  uint8 *tmp = build_ietags(tags, &tmpl);
-		G->dprobe = build_packet(prober,sizeof(prober)-1,tmp,tmpl);
-		G->reql = sizeof(prober)-1 + tmpl;
-		free(tmp);
-	};
-
 	vprint("[+] Scanning for beacon from '%s' on channel '%s'\n",
 			(G->ssids ? G->ssids : G->essid), G->schan);
 
 	while (1) {
 	ap_beacon:
 		if (G->probe) {
-			if (!G->test)
-				result = send_packet(G, G->dprobe, G->reql, 1);
+			if (!G->test) {
+				result = send_probe_request(G);
+				if (result != SUCCESS) {
+					vprint("[X] Unable to send probe request\n");
+					return 4;
+				}
+			}
 			result = next_packet(G, MAC_TYPE_MGMT, MAC_ST_PROBE_RESP,
 							G->hwmac, G->bssid, PKT_PR, TRUE);
 		} else
@@ -1238,6 +1234,7 @@ restart:
 		send_packet(G, deauth, sizeof(deauth)-1, 0);
 	};
 
+	deferred_reset(G);
 	pcap_close(G->pfd);
 
 	if (result == SUCCESS)

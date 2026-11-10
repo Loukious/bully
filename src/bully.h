@@ -192,6 +192,11 @@ struct global {
 	pcap_t	*pfd;
 	phdr_t	*phdr;
 	frame_t	*inp;
+	struct deferred_packet *deferred_head, *deferred_tail, *deferred_parsed;
+	unsigned int deferred_count;
+	pcap_t	*deferred_pfd;
+	uint8	deferred_bssid[6], deferred_hwmac[6];
+	struct timeval deferred_since;
 	uint8	*asshat;
 	int	assl;
 	uint8	*dprobe;
